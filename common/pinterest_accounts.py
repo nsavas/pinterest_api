@@ -7,8 +7,8 @@ so list_entity_ids() is a single generic pager used by every job.
 
 import logging
 
-from .config import DEFAULT_PAGE_SIZE, PINTEREST_API_BASE
-from .http import request_with_backoff
+from pinterest_config import DEFAULT_PAGE_SIZE, PINTEREST_API_BASE
+from pinterest_http import request_with_backoff
 
 logger = logging.getLogger(__name__)
 

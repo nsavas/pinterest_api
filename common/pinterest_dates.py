@@ -13,7 +13,7 @@ for one-off backfills.
 
 from datetime import date, timedelta
 
-from .config import DEFAULT_LOOKBACK_DAYS
+from pinterest_config import DEFAULT_LOOKBACK_DAYS
 
 
 def resolve_date_range(args: dict) -> tuple:

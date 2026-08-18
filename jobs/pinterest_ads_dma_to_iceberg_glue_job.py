@@ -1,13 +1,18 @@
 """
-AWS Glue job: pull campaign-level performance data from the Pinterest Ads API
-(v5) and upsert it into an Iceberg table in S3.
+AWS Glue job: pull ad-level performance data broken down by DMA (Designated
+Market Area) from the Pinterest Ads API (v5) and upsert it into an Iceberg
+table in S3.
 
 Depends on the flat .py modules in ../common/ -- see ../README.md for how
 they're packaged (no wrapping package folder -- see the README for why) and
-attached via --extra-py-files. All auth, pagination, retry, date-range, and
-Iceberg-upsert logic lives there and is shared with the ad- and
-ad-group-level jobs; this file only declares what's specific to the
-campaign level: which columns to request, the row schema, and the merge key.
+attached via --extra-py-files.
+
+This is a companion to pinterest_ads_to_iceberg_glue_job.py, not a
+replacement -- it hits a structurally different endpoint
+(ads/targeting_analytics, not ads/analytics) and produces a different grain
+of table: one row per (ad, date, DMA) instead of one row per (ad, date).
+Query DMA names by joining this table's dma_code column against
+pinterest_dma_reference (see pinterest_dma_reference_to_iceberg_glue_job.py).
 
 Glue job parameters expected (set as job arguments):
 
@@ -18,7 +23,7 @@ Glue job parameters expected (set as job arguments):
   --AWS_REGION                e.g. us-east-1
   --ICEBERG_CATALOG           Glue Data Catalog name registered as an Iceberg catalog, e.g. "glue_catalog"
   --ICEBERG_DATABASE          target database name, e.g. "marketing"
-  --ICEBERG_TABLE             target table name, e.g. "pinterest_campaign_performance"
+  --ICEBERG_TABLE             target table name, e.g. "pinterest_ad_dma_performance"
   --ICEBERG_WAREHOUSE_PATH    s3://bucket/prefix for the Iceberg warehouse
 
 Optional job parameters:
@@ -38,12 +43,27 @@ Also pass, at the job level (not in this script):
 
 This script is written for Glue 4.0+ (Spark 3.3+, native Iceberg support).
 
-Design notes specific to the campaign level:
-- Unlike ads/analytics, campaigns/analytics requires campaign_ids on every
-  call (there's no "omit the filter to get everything" mode), so we always
-  list campaign IDs first and batch analytics requests in chunks of 250
-  (Pinterest's documented max campaign_ids per call -- larger than the
-  100-id ad-level batches).
+Design notes specific to DMA breakdown:
+- targeting_types=LOCATION is Pinterest's DMA-level geo breakdown -- verified
+  against Pinterest's published v5 OpenAPI spec
+  (https://github.com/pinterest/api-description/blob/main/v5/openapi.yaml)
+  on 2026-08-18. Its example response shows targeting_value "500" under
+  targeting_type LOCATION (a bare Nielsen-style DMA code), versus "US-CA" for
+  REGION (state-level) and "US:94102" for GEO (ZIP-level) -- LOCATION is the
+  DMA granularity, the other two are coarser/finer and not what this job asks
+  for.
+- ads/targeting_analytics's response nests the requested identifier/date/
+  metric columns inside each row's "metrics" object, alongside sibling
+  "targeting_type"/"targeting_value" fields -- structurally different from
+  ads/analytics's flat rows. pinterest_targeting.py's fetch_targeting_analytics()
+  already unwraps the outer "data" list; this job still has to reach into
+  each item's "metrics" dict itself.
+- targeting_value ("500") is a bare code with no name attached. Resolving it
+  to a human-readable DMA name requires joining against a separate reference
+  table -- see pinterest_dma_reference_to_iceberg_glue_job.py.
+- Same batching rationale as the base ad-level job: ads/targeting_analytics
+  requires ad_ids on every call (max 250 per Pinterest's documented cap), so
+  we list ad IDs first, then batch.
 """
 
 import os
@@ -65,38 +85,39 @@ from pyspark.sql.types import (
 )
 
 from pinterest_accounts import list_entity_ids, resolve_ad_account_ids
-from pinterest_analytics import fetch_analytics
 from pinterest_auth import get_secret, refresh_access_token
 from pinterest_dates import chunked, resolve_date_range
 from pinterest_glue_args import resolve_args
 from pinterest_iceberg import upsert
+from pinterest_targeting import fetch_targeting_analytics
 
 import logging
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("pinterest_campaigns_to_iceberg")
+logger = logging.getLogger("pinterest_ads_dma_to_iceberg")
 
-ENTITY_PATH = "campaigns"
-ID_PARAM_NAME = "campaign_ids"
-ID_BATCH_SIZE = 250  # Pinterest's documented max campaign_ids per analytics call
+ENTITY_PATH = "ads"
+ID_PARAM_NAME = "ad_ids"
+ID_BATCH_SIZE = 250  # Pinterest's documented max ad_ids per targeting_analytics call
+TARGETING_TYPE = "LOCATION"  # Pinterest's DMA-level geo breakdown
 
+# Same metric set as pinterest_ads_to_iceberg_glue_job.py's ANALYTICS_COLUMNS,
+# deliberately kept identical so summing this table's metrics across DMA for
+# a given (ad, date) is comparable to that table's row for the same (ad,
+# date) -- modulo any traffic Pinterest doesn't attribute to a DMA.
 # Verified against the `ReportingColumnSync` enum in Pinterest's published v5
-# OpenAPI spec (https://github.com/pinterest/api-description/blob/main/v5/openapi.yaml)
-# on 2026-08-17. Re-check that file if you add columns -- the interactive
-# docs site doesn't render for automated fetches, so the OpenAPI spec is the
-# most reliable source of truth for exact enum names.
+# OpenAPI spec on 2026-08-18.
 ANALYTICS_COLUMNS = [
+    "AD_ID",
+    "AD_GROUP_ID",
     "CAMPAIGN_ID",
     "AD_ACCOUNT_ID",
-    "CAMPAIGN_NAME",
-    "CAMPAIGN_ENTITY_STATUS",
-    "CAMPAIGN_OBJECTIVE_TYPE",
     "SPEND_IN_DOLLAR",
     "TOTAL_IMPRESSION",
     "TOTAL_CLICKTHROUGH",
     "TOTAL_ENGAGEMENT",
     "TOTAL_CONVERSIONS",
-    "LEADS",                    # lead-gen ads are typically the relevant conversion type for insurance
+    "LEADS",
     "COST_PER_LEAD",
     "ECPC_IN_DOLLAR",
     "CPM_IN_DOLLAR",
@@ -106,10 +127,10 @@ ANALYTICS_COLUMNS = [
 
 SCHEMA = StructType([
     StructField("ad_account_id", StringType(), False),
-    StructField("campaign_id", StringType(), False),
-    StructField("campaign_name", StringType(), True),
-    StructField("campaign_status", StringType(), True),
-    StructField("campaign_objective_type", StringType(), True),
+    StructField("ad_id", StringType(), False),
+    StructField("ad_group_id", StringType(), True),
+    StructField("campaign_id", StringType(), True),
+    StructField("dma_code", StringType(), False),
     StructField("stat_date", StringType(), False),  # cast to date in the Iceberg merge
     StructField("spend", DoubleType(), True),
     StructField("impressions", LongType(), True),
@@ -129,10 +150,10 @@ SCHEMA = StructType([
 # source string column via a select_expr override.
 ICEBERG_COLUMNS = [
     ("ad_account_id", "string"),
+    ("ad_id", "string"),
+    ("ad_group_id", "string"),
     ("campaign_id", "string"),
-    ("campaign_name", "string"),
-    ("campaign_status", "string"),
-    ("campaign_objective_type", "string"),
+    ("dma_code", "string"),
     ("stat_date", "date", "CAST(stat_date AS date)"),
     ("spend", "double"),
     ("impressions", "bigint"),
@@ -147,7 +168,7 @@ ICEBERG_COLUMNS = [
     ("video_completions", "bigint"),
     ("ingested_at", "timestamp"),
 ]
-KEY_COLUMNS = ["ad_account_id", "campaign_id", "stat_date"]
+KEY_COLUMNS = ["ad_account_id", "ad_id", "dma_code", "stat_date"]
 PARTITION_EXPR = "days(stat_date)"
 
 REQUIRED_ARGS = [
@@ -162,17 +183,18 @@ REQUIRED_ARGS = [
 OPTIONAL_ARGS = ["AD_ACCOUNT_IDS", "START_DATE", "END_DATE", "LOOKBACK_DAYS"]
 
 
-def to_row(ad_account_id: str, stat_date: str, record: dict, ingested_at: datetime) -> tuple:
+def to_row(ad_account_id: str, dma_code: str, stat_date: str, metrics: dict,
+           ingested_at: datetime) -> tuple:
     def num(key, cast=float):
-        val = record.get(key)
+        val = metrics.get(key)
         return cast(val) if val is not None else None
 
     return (
         ad_account_id,
-        record.get("CAMPAIGN_ID"),
-        record.get("CAMPAIGN_NAME"),
-        record.get("CAMPAIGN_ENTITY_STATUS"),
-        record.get("CAMPAIGN_OBJECTIVE_TYPE"),
+        metrics.get("AD_ID"),
+        metrics.get("AD_GROUP_ID"),
+        metrics.get("CAMPAIGN_ID"),
+        dma_code,
         stat_date,
         num("SPEND_IN_DOLLAR", float),
         num("TOTAL_IMPRESSION", int),
@@ -222,7 +244,7 @@ def main():
         return
 
     start_date, end_date = resolve_date_range(args)
-    logger.info("Pulling Pinterest campaign analytics for %s..%s across %d account(s)",
+    logger.info("Pulling Pinterest ad DMA analytics for %s..%s across %d account(s)",
                 start_date, end_date, len(ad_account_ids))
     ingested_at = datetime.now(timezone.utc)
 
@@ -230,19 +252,21 @@ def main():
     for ad_account_id in ad_account_ids:
         entity_ids = list_entity_ids(ad_account_id, access_token, ENTITY_PATH)
         if not entity_ids:
-            logger.info("Ad account %s has no campaigns, skipping", ad_account_id)
+            logger.info("Ad account %s has no ads, skipping", ad_account_id)
             continue
 
         for batch in chunked(entity_ids, ID_BATCH_SIZE):
-            analytics = fetch_analytics(
-                ad_account_id, ENTITY_PATH, ID_PARAM_NAME, batch,
+            breakdown_rows = fetch_targeting_analytics(
+                ad_account_id, ENTITY_PATH, ID_PARAM_NAME, batch, TARGETING_TYPE,
                 start_date, end_date, access_token, ANALYTICS_COLUMNS,
             )
-            for record in analytics:
-                stat_date = record.get("DATE", start_date)
-                all_rows.append(to_row(ad_account_id, stat_date, record, ingested_at))
+            for item in breakdown_rows:
+                dma_code = item.get("targeting_value")
+                metrics = item.get("metrics", {})
+                stat_date = metrics.get("DATE", start_date)
+                all_rows.append(to_row(ad_account_id, dma_code, stat_date, metrics, ingested_at))
 
-    logger.info("Fetched %d campaign-day rows across %d ad account(s)", len(all_rows), len(ad_account_ids))
+    logger.info("Fetched %d ad-DMA-day rows across %d ad account(s)", len(all_rows), len(ad_account_ids))
 
     if not all_rows:
         logger.info("No data returned for %s..%s, nothing to write", start_date, end_date)
@@ -251,7 +275,7 @@ def main():
 
     df = spark.createDataFrame(all_rows, schema=SCHEMA)
     upsert(spark, df, full_table_name, ICEBERG_COLUMNS, KEY_COLUMNS,
-           PARTITION_EXPR, temp_view_name="pinterest_campaigns_source")
+           PARTITION_EXPR, temp_view_name="pinterest_ads_dma_source")
 
     job.commit()
 

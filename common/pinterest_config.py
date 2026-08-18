@@ -8,9 +8,9 @@ PINTEREST_API_BASE = "https://api.pinterest.com/v5"
 DEFAULT_PAGE_SIZE = 100
 
 # Default width of the rolling incremental pull when a job isn't given
-# explicit START_DATE/END_DATE. See common/dates.py for why 14 days.
+# explicit START_DATE/END_DATE. See pinterest_dates.py for why 14 days.
 DEFAULT_LOOKBACK_DAYS = 14
 
-# HTTP retry/backoff defaults for common/http.py's request_with_backoff().
+# HTTP retry/backoff defaults for pinterest_http.py's request_with_backoff().
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2

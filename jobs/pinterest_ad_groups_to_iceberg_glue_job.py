@@ -2,11 +2,12 @@
 AWS Glue job: pull ad-group-level performance data from the Pinterest Ads API
 (v5) and upsert it into an Iceberg table in S3.
 
-Depends on the ../common package -- see ../README.md for how to package and
-attach it to this job via --extra-py-files. All auth, pagination, retry,
-date-range, and Iceberg-upsert logic lives there and is shared with the
-ad- and campaign-level jobs; this file only declares what's specific to the
-ad group level: which columns to request, the row schema, and the merge key.
+Depends on the flat .py modules in ../common/ -- see ../README.md for how
+they're packaged (no wrapping package folder -- see the README for why) and
+attached via --extra-py-files. All auth, pagination, retry, date-range, and
+Iceberg-upsert logic lives there and is shared with the ad- and
+campaign-level jobs; this file only declares what's specific to the ad
+group level: which columns to request, the row schema, and the merge key.
 
 Glue job parameters expected (set as job arguments):
 
@@ -48,7 +49,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
 
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -62,12 +63,12 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from common.accounts import list_entity_ids, resolve_ad_account_ids
-from common.analytics import fetch_analytics
-from common.auth import get_secret, refresh_access_token
-from common.dates import chunked, resolve_date_range
-from common.glue_args import resolve_args
-from common.iceberg import upsert
+from pinterest_accounts import list_entity_ids, resolve_ad_account_ids
+from pinterest_analytics import fetch_analytics
+from pinterest_auth import get_secret, refresh_access_token
+from pinterest_dates import chunked, resolve_date_range
+from pinterest_glue_args import resolve_args
+from pinterest_iceberg import upsert
 
 import logging
 

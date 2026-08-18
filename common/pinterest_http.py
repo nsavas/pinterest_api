@@ -5,7 +5,7 @@ import time
 
 import requests
 
-from .config import INITIAL_BACKOFF_SECONDS, MAX_RETRIES
+from pinterest_config import INITIAL_BACKOFF_SECONDS, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 

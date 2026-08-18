@@ -14,8 +14,8 @@ three endpoints -- verified against Pinterest's published v5 OpenAPI spec
 site is a client-rendered SPA that doesn't render for automated fetches.
 """
 
-from .config import PINTEREST_API_BASE
-from .http import request_with_backoff
+from pinterest_config import PINTEREST_API_BASE
+from pinterest_http import request_with_backoff
 
 
 def fetch_analytics(ad_account_id: str, analytics_path: str, id_param_name: str,

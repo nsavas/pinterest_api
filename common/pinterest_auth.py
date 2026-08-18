@@ -14,7 +14,7 @@ import logging
 import boto3
 import requests
 
-from .config import PINTEREST_API_BASE
+from pinterest_config import PINTEREST_API_BASE
 
 logger = logging.getLogger(__name__)
 
