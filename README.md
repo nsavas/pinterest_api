@@ -1,6 +1,6 @@
 # Pinterest Ads → Iceberg (AWS Glue)
 
-Six Glue jobs that pull data from the Pinterest Ads API (v5) and write it
+Eight Glue jobs that pull data from the Pinterest Ads API (v5) and write it
 into Iceberg tables in S3:
 
 - **Three performance jobs** at the ad, ad group, and campaign level.
@@ -10,11 +10,15 @@ into Iceberg tables in S3:
   below for why it can't just be another column).
 - **One DMA reference job** that resolves the bare DMA codes in that table to
   human-readable names.
+- **Two demographic breakdown jobs**, at the ad level only, giving ad-level
+  performance broken down by gender and, separately, by age bucket -- two
+  jobs writing two tables, not one combined table (see "Demographic jobs"
+  below for why that split matters).
 - **One dimensions job** that pulls the full Campaign/Ad Group/Ad metadata
   objects (name, status, budget, targeting, creative settings -- every field,
   no metrics) into three tables in a single run (see "Dimensions job" below).
 
-All six share one `common/` library for everything that isn't
+All eight share one `common/` library for everything that isn't
 job-specific: OAuth token refresh, ad-account/entity discovery, HTTP
 retry/backoff, incremental date-range resolution, and the Iceberg
 write helpers (upsert for time-series fact data, full-replace for reference/
@@ -38,9 +42,11 @@ pinterest_ads_pipeline/
 │   ├── pinterest_ads_to_iceberg_glue_job.py
 │   ├── pinterest_campaigns_to_iceberg_glue_job.py
 │   ├── pinterest_ad_groups_to_iceberg_glue_job.py
-│   ├── pinterest_ads_dma_to_iceberg_glue_job.py       ad-level performance broken down by DMA
-│   ├── pinterest_dma_reference_to_iceberg_glue_job.py  DMA code -> name lookup table
-│   └── pinterest_dimensions_to_iceberg_glue_job.py     campaign/ad group/ad metadata (no metrics)
+│   ├── pinterest_ads_dma_to_iceberg_glue_job.py             ad-level performance broken down by DMA
+│   ├── pinterest_dma_reference_to_iceberg_glue_job.py        DMA code -> name lookup table
+│   ├── pinterest_ads_gender_to_iceberg_glue_job.py           ad-level performance broken down by gender
+│   ├── pinterest_ads_age_to_iceberg_glue_job.py              ad-level performance broken down by age bucket
+│   └── pinterest_dimensions_to_iceberg_glue_job.py           campaign/ad group/ad metadata (no metrics)
 ├── build_deps.ps1 / build_deps.sh   zip common/'s contents (flat) for --extra-py-files
 ├── requirements.txt
 └── README.md
@@ -81,7 +87,7 @@ packaged and attached via `--extra-py-files`. The build scripts zip the
 aws s3 cp pinterest_common.zip s3://<your-bucket>/pinterest_common.zip
 ```
 
-For **each** of the six Glue jobs, upload the corresponding script from
+For **each** of the eight Glue jobs, upload the corresponding script from
 `jobs/` as the job's script, and set these job parameters:
 
 ```
@@ -105,7 +111,7 @@ in `jobs/` for the full list):
 | `--START_DATE` / `--END_DATE` | no* | explicit backfill range; omit for the rolling incremental window |
 | `--LOOKBACK_DAYS` | no* | default 14; width of the rolling window when dates are omitted |
 
-\* The four performance/DMA jobs take all three optional args.
+\* The six performance/DMA/demographic jobs take all three optional args.
 `pinterest_dma_reference_to_iceberg_glue_job.py` and
 `pinterest_dimensions_to_iceberg_glue_job.py` take **none** of them --
 neither is time-series data, so each only needs the required arguments.
@@ -123,6 +129,8 @@ Suggested table names, one per job:
 | `pinterest_ad_groups_to_iceberg_glue_job.py` | `pinterest_ad_group_performance` |
 | `pinterest_ads_dma_to_iceberg_glue_job.py` | `pinterest_ad_dma_performance` |
 | `pinterest_dma_reference_to_iceberg_glue_job.py` | `pinterest_dma_reference` |
+| `pinterest_ads_gender_to_iceberg_glue_job.py` | `pinterest_ad_gender_performance` |
+| `pinterest_ads_age_to_iceberg_glue_job.py` | `pinterest_ad_age_performance` |
 | `pinterest_dimensions_to_iceberg_glue_job.py` | `pinterest_campaign_dim`, `pinterest_ad_group_dim`, `pinterest_ad_dim` |
 
 Whenever `common/` changes, re-run `build_deps.sh`/`.ps1` and re-upload the
@@ -130,12 +138,48 @@ zip -- Glue doesn't pick up changes to an S3 object automatically on its own,
 you're re-deploying the same object key. Adding `pinterest_targeting.py`, or
 `list_entities()` in `pinterest_accounts.py`, both count as `common/`
 changes, so rebuild and re-upload if you're picking up the DMA or dimensions
-jobs after already having deployed the earlier ones.
+jobs after already having deployed the earlier ones. The two demographic
+jobs don't need this -- they reuse `fetch_targeting_analytics()` unchanged
+(see "Demographic jobs" below for why).
+
+## Demographic jobs
+
+`pinterest_ads_gender_to_iceberg_glue_job.py` and
+`pinterest_ads_age_to_iceberg_glue_job.py` give ad-level performance broken
+down by gender and by age bucket, respectively. Same endpoint family as the
+DMA job (`ads/targeting_analytics`), requesting `GENDER` or `AGE_BUCKET`
+instead of `LOCATION` -- one `targeting_type`, one job, one table each.
+
+- **Two separate jobs/tables, not one combined table.** An earlier version
+  of this requested both breakdowns in a single job, writing one table with
+  a `demographic_type` column distinguishing `GENDER` rows from `AGE_BUCKET`
+  rows. That worked, but every query against it had to remember to filter
+  to one `demographic_type` before aggregating -- `GENDER` and `AGE_BUCKET`
+  are two *independent* breakdowns of the same underlying traffic (Pinterest
+  says so explicitly), so summing across both silently doubles every metric.
+  Splitting into two single-purpose tables removes that footgun entirely:
+  every row in `pinterest_ad_gender_performance` is already scoped to one
+  gender, so `SUM(spend)` for an `(ad_id, stat_date)` just works with no
+  `WHERE` clause needed. The same double-counting still applies if you ever
+  join or union the two tables together and sum across both -- that's
+  inherent to the data (two independent slices of the same traffic), not
+  something table structure can fully hide.
+- **`GENDER`/`AGE_BUCKET` values are already human-readable** (`"female"`,
+  `"45-49"`) -- unlike DMA codes, no separate reference/lookup table is
+  needed for either.
+- **Deliberately excludes `AGE_BUCKET_AND_GENDER`.** That's the true age x
+  gender cross-tab, but Pinterest's spec flags it as "BETA and not yet
+  available to all users." Worth adding as a third job once confirmed
+  enabled on your accounts, rather than building against an unconfirmed
+  BETA field now.
+- Both jobs pass their single `targeting_type` straight through
+  `fetch_targeting_analytics()` unchanged -- no `common/` changes were
+  needed to add either.
 
 ## Dimensions job
 
 `pinterest_dimensions_to_iceberg_glue_job.py` is structurally different from
-the other five, since it's pulling metadata, not performance data:
+the other seven, since it's pulling metadata, not performance data:
 
 - **Same account-discovery pattern, no batching needed.** Like every other
   job, it lists every ad account first, then pulls per account -- but unlike
