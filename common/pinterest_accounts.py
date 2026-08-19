@@ -2,7 +2,9 @@
 
 All three list endpoints -- /ads, /campaigns, /ad_groups -- share the same
 bookmark-pagination response shape ({"items": [...], "bookmark": ...|null}),
-so list_entity_ids() is a single generic pager used by every job.
+so list_entities() is a single generic pager used by every job; list_entity_ids()
+is a thin wrapper over it for jobs that only need IDs (to batch into an
+analytics call), not the full entity object.
 """
 
 import logging
@@ -42,15 +44,16 @@ def list_ad_accounts(access_token: str) -> list:
     return accounts
 
 
-def list_entity_ids(ad_account_id: str, access_token: str, entity_path: str) -> list:
+def list_entities(ad_account_id: str, access_token: str, entity_path: str) -> list:
     """Page through /ad_accounts/{id}/{entity_path} with no filters, collecting
-    every entity ID for the account.
+    the full entity object (every field the API returns) for every entity in
+    the account.
 
     entity_path is "ads", "campaigns", or "ad_groups" -- each accepts an
     optional campaign_ids/ad_group_ids/ad_ids filter which we omit to get
     every entity in the account back in one paginated sweep.
     """
-    ids = []
+    entities = []
     bookmark = None
     headers = {"Authorization": f"Bearer {access_token}"}
 
@@ -66,15 +69,22 @@ def list_entity_ids(ad_account_id: str, access_token: str, entity_path: str) -> 
             params=params,
         )
         body = resp.json()
-        for item in body.get("items", []):
-            ids.append(item["id"])
+        entities.extend(body.get("items", []))
 
         bookmark = body.get("bookmark")
         if not bookmark:
             break
 
-    logger.info("Ad account %s: found %d %s", ad_account_id, len(ids), entity_path)
-    return ids
+    logger.info("Ad account %s: found %d %s", ad_account_id, len(entities), entity_path)
+    return entities
+
+
+def list_entity_ids(ad_account_id: str, access_token: str, entity_path: str) -> list:
+    """Same as list_entities(), but returns just each entity's `id` -- for
+    jobs that only need IDs to batch into an analytics call, not the full
+    entity object.
+    """
+    return [entity["id"] for entity in list_entities(ad_account_id, access_token, entity_path)]
 
 
 def resolve_ad_account_ids(args: dict, access_token: str) -> list:

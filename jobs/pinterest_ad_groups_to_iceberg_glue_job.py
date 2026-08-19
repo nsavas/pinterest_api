@@ -100,6 +100,10 @@ ANALYTICS_COLUMNS = [
     "ECPC_IN_DOLLAR",
     "CPM_IN_DOLLAR",
     "CTR",
+    "TOTAL_VIDEO_P0_COMBINED",
+    "TOTAL_VIDEO_P25_COMBINED",
+    "TOTAL_VIDEO_P50_COMBINED",
+    "TOTAL_VIDEO_P75_COMBINED",
     "TOTAL_VIDEO_P100_COMPLETE",
 ]
 
@@ -120,6 +124,10 @@ SCHEMA = StructType([
     StructField("ecpc", DoubleType(), True),
     StructField("cpm", DoubleType(), True),
     StructField("ctr", DoubleType(), True),
+    StructField("video_p0_combined", LongType(), True),
+    StructField("video_p25_combined", LongType(), True),
+    StructField("video_p50_combined", LongType(), True),
+    StructField("video_p75_combined", LongType(), True),
     StructField("video_completions", LongType(), True),
     StructField("ingested_at", TimestampType(), False),
 ])
@@ -143,6 +151,10 @@ ICEBERG_COLUMNS = [
     ("ecpc", "double"),
     ("cpm", "double"),
     ("ctr", "double"),
+    ("video_p0_combined", "bigint"),
+    ("video_p25_combined", "bigint"),
+    ("video_p50_combined", "bigint"),
+    ("video_p75_combined", "bigint"),
     ("video_completions", "bigint"),
     ("ingested_at", "timestamp"),
 ]
@@ -183,6 +195,10 @@ def to_row(ad_account_id: str, stat_date: str, record: dict, ingested_at: dateti
         num("ECPC_IN_DOLLAR", float),
         num("CPM_IN_DOLLAR", float),
         num("CTR", float),
+        num("TOTAL_VIDEO_P0_COMBINED", int),
+        num("TOTAL_VIDEO_P25_COMBINED", int),
+        num("TOTAL_VIDEO_P50_COMBINED", int),
+        num("TOTAL_VIDEO_P75_COMBINED", int),
         num("TOTAL_VIDEO_P100_COMPLETE", int),
         ingested_at,
     )

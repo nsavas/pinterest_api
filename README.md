@@ -1,6 +1,6 @@
 # Pinterest Ads → Iceberg (AWS Glue)
 
-Five Glue jobs that pull data from the Pinterest Ads API (v5) and write it
+Six Glue jobs that pull data from the Pinterest Ads API (v5) and write it
 into Iceberg tables in S3:
 
 - **Three performance jobs** at the ad, ad group, and campaign level.
@@ -10,12 +10,15 @@ into Iceberg tables in S3:
   below for why it can't just be another column).
 - **One DMA reference job** that resolves the bare DMA codes in that table to
   human-readable names.
+- **One dimensions job** that pulls the full Campaign/Ad Group/Ad metadata
+  objects (name, status, budget, targeting, creative settings -- every field,
+  no metrics) into three tables in a single run (see "Dimensions job" below).
 
-All five share one `common/` library for everything that isn't
+All six share one `common/` library for everything that isn't
 job-specific: OAuth token refresh, ad-account/entity discovery, HTTP
 retry/backoff, incremental date-range resolution, and the Iceberg
-write helpers (upsert for time-series fact data, full-replace for reference
-data).
+write helpers (upsert for time-series fact data, full-replace for reference/
+dimension data).
 
 ## Layout
 
@@ -25,7 +28,7 @@ pinterest_ads_pipeline/
 │   ├── pinterest_config.py        constants (API base URL, page size, retry/backoff, lookback default)
 │   ├── pinterest_auth.py          Secrets Manager + Pinterest OAuth token refresh
 │   ├── pinterest_http.py          retry/backoff wrapper around requests
-│   ├── pinterest_accounts.py      ad account discovery + generic entity-ID pager (ads/campaigns/ad_groups)
+│   ├── pinterest_accounts.py      ad account discovery + generic entity pager (full objects or just IDs)
 │   ├── pinterest_analytics.py     generic caller for the .../analytics endpoints
 │   ├── pinterest_targeting.py     generic caller for .../targeting_analytics (e.g. DMA breakdown) + the code->name lookup
 │   ├── pinterest_dates.py         rolling-window date-range resolution + chunking
@@ -36,7 +39,8 @@ pinterest_ads_pipeline/
 │   ├── pinterest_campaigns_to_iceberg_glue_job.py
 │   ├── pinterest_ad_groups_to_iceberg_glue_job.py
 │   ├── pinterest_ads_dma_to_iceberg_glue_job.py       ad-level performance broken down by DMA
-│   └── pinterest_dma_reference_to_iceberg_glue_job.py  DMA code -> name lookup table
+│   ├── pinterest_dma_reference_to_iceberg_glue_job.py  DMA code -> name lookup table
+│   └── pinterest_dimensions_to_iceberg_glue_job.py     campaign/ad group/ad metadata (no metrics)
 ├── build_deps.ps1 / build_deps.sh   zip common/'s contents (flat) for --extra-py-files
 ├── requirements.txt
 └── README.md
@@ -77,7 +81,7 @@ packaged and attached via `--extra-py-files`. The build scripts zip the
 aws s3 cp pinterest_common.zip s3://<your-bucket>/pinterest_common.zip
 ```
 
-For **each** of the five Glue jobs, upload the corresponding script from
+For **each** of the six Glue jobs, upload the corresponding script from
 `jobs/` as the job's script, and set these job parameters:
 
 ```
@@ -95,32 +99,72 @@ in `jobs/` for the full list):
 | `--AWS_REGION` | yes | e.g. `us-east-1` |
 | `--ICEBERG_CATALOG` | yes | Glue Data Catalog name registered as an Iceberg catalog |
 | `--ICEBERG_DATABASE` | yes | target database |
-| `--ICEBERG_TABLE` | yes | target table (different per job -- see below) |
+| `--ICEBERG_TABLE` | yes\*\* | target table (different per job -- see below) |
 | `--ICEBERG_WAREHOUSE_PATH` | yes | `s3://bucket/prefix` |
 | `--AD_ACCOUNT_IDS` | no* | comma-separated allowlist; omit to auto-discover every account the token can see |
 | `--START_DATE` / `--END_DATE` | no* | explicit backfill range; omit for the rolling incremental window |
 | `--LOOKBACK_DAYS` | no* | default 14; width of the rolling window when dates are omitted |
 
 \* The four performance/DMA jobs take all three optional args.
-`pinterest_dma_reference_to_iceberg_glue_job.py` takes **none** of them --
-it's not account-scoped or time-series, so it only needs the six required
-arguments above.
+`pinterest_dma_reference_to_iceberg_glue_job.py` and
+`pinterest_dimensions_to_iceberg_glue_job.py` take **none** of them --
+neither is time-series data, so each only needs the required arguments.
 
-Suggested `--ICEBERG_TABLE` values, one per job:
+\*\* `pinterest_dimensions_to_iceberg_glue_job.py` writes three tables in one
+run, so instead of a single `--ICEBERG_TABLE` it takes three:
+`--ICEBERG_TABLE_CAMPAIGNS`, `--ICEBERG_TABLE_AD_GROUPS`, `--ICEBERG_TABLE_ADS`.
 
-| Job | Table |
+Suggested table names, one per job:
+
+| Job | Table(s) |
 |---|---|
 | `pinterest_ads_to_iceberg_glue_job.py` | `pinterest_ad_performance` |
 | `pinterest_campaigns_to_iceberg_glue_job.py` | `pinterest_campaign_performance` |
 | `pinterest_ad_groups_to_iceberg_glue_job.py` | `pinterest_ad_group_performance` |
 | `pinterest_ads_dma_to_iceberg_glue_job.py` | `pinterest_ad_dma_performance` |
 | `pinterest_dma_reference_to_iceberg_glue_job.py` | `pinterest_dma_reference` |
+| `pinterest_dimensions_to_iceberg_glue_job.py` | `pinterest_campaign_dim`, `pinterest_ad_group_dim`, `pinterest_ad_dim` |
 
 Whenever `common/` changes, re-run `build_deps.sh`/`.ps1` and re-upload the
 zip -- Glue doesn't pick up changes to an S3 object automatically on its own,
-you're re-deploying the same object key. Adding `pinterest_targeting.py`
-counts as a `common/` change, so rebuild and re-upload if you're picking up
-the DMA jobs after already having deployed the other three.
+you're re-deploying the same object key. Adding `pinterest_targeting.py`, or
+`list_entities()` in `pinterest_accounts.py`, both count as `common/`
+changes, so rebuild and re-upload if you're picking up the DMA or dimensions
+jobs after already having deployed the earlier ones.
+
+## Dimensions job
+
+`pinterest_dimensions_to_iceberg_glue_job.py` is structurally different from
+the other five, since it's pulling metadata, not performance data:
+
+- **Same account-discovery pattern, no batching needed.** Like every other
+  job, it lists every ad account first, then pulls per account -- but unlike
+  the analytics endpoints, `GET /ad_accounts/{id}/campaigns` (and
+  `/ad_groups`, `/ads`) return the *full* entity object directly with no
+  `columns` selector and no ID-list filter required, so there's no separate
+  "list IDs then fetch details in batches" step.
+- **All available fields, not just a curated subset.** Every scalar field
+  (string/int/bool/number) each entity's OpenAPI schema defines becomes its
+  own typed column. Every nested object or array field (`targeting_spec`,
+  `tracking_urls`, `rejected_reasons`, `carting_products`, etc.) is
+  serialized to a `..._json` string column instead of a native Spark
+  struct/array column -- deliberately, since Pinterest's nested ad-config
+  shapes vary by campaign objective and creative type, and a rigid Spark
+  schema would break or silently null fields the moment Pinterest returns a
+  shape it wasn't built from. Query those columns with `from_json`/
+  `get_json_object` in Spark or `json_extract` in Athena.
+- **Full replace per table, not merge/upsert**, same reasoning as the DMA
+  reference table: a merge only ever adds or updates rows, so a
+  campaign/ad group/ad deleted on Pinterest's side would never disappear
+  from the table. All three tables are written once, at the very end, after
+  every account has been fully fetched, so a mid-run failure leaves the
+  existing tables untouched rather than partially overwritten.
+- Both entity schemas' exact fields and types were verified against
+  Pinterest's OpenAPI spec on 2026-08-18, including two that are easy to get
+  wrong by guessing: `customer_segment_id` is a numeric *string*
+  (`Pinterest.Lib.IntegerFormatType`), not an integer, and `dca_assets` has
+  no declared type in the spec at all -- exactly why it's JSON-serialized
+  rather than assumed to be a well-typed object.
 
 ## Why DMA is a separate job, not a column
 
